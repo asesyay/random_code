@@ -156,17 +156,35 @@ def flag_points_for_inn(final_df, df, inn_value,
       - строит интервалы ИП (DaData) и "гэпы без ИП";
       - для КАЖДОЙ точки (point_col=id_cd) строит интервалы temp_closed;
       - учитывает фактическую дату открытия точки (open_date);
-      - проверяет покрытие: каждую "дыру без ИП" должна закрывать точка.
+      - возвращает флаги покрытий + списки дат из источников.
 
     Возвращает (flags_df, ip_open_intervals, ip_gaps).
     flags_df колонки:
       inn, id_cd, ok_flag, gap_start, gap_end, uncovered_start, uncovered_end,
-      closed_dates, reopen_dates, tc_intervals, point_open_date
+      closed_dates, reopen_dates, tc_intervals, point_open_date,
+      dadata_registration_dates, dadata_liquidation_dates
     """
-    # интервалы ИП из DaData
+    # интервалы ИП из DaData и базовые "гэпы без ИП"
     ip_open = dadata_intervals_for_inn(final_df, inn_value)
-    # исходные "гэпы без ИП" (между периодами действия ИП)
     gaps = gaps_without_ip(ip_open)
+
+    # подготовим списки всех registration/liquidation дат из DaData для этого ИНН
+    json_series = final_df.loc[final_df['inn'] == inn_value, 'json_data']
+    reg_dates, liq_dates = [], []
+    for js in json_series:
+        data = _safe_parse_json(js)
+        for s in (data or {}).get('suggestions', []):
+            st = (s.get('data') or {}).get('state') or {}
+            if st.get('registration_date'):
+                reg_dates.append(pd.to_datetime(
+                    st['registration_date'], unit='ms', errors='coerce'))
+            if st.get('liquidation_date'):
+                liq_dates.append(pd.to_datetime(
+                    st['liquidation_date'], unit='ms', errors='coerce'))
+    reg_dates = sorted([d.tz_convert(None) if getattr(
+        d, 'tz', None) else d for d in reg_dates if pd.notna(d)])
+    liq_dates = sorted([d.tz_convert(None) if getattr(
+        d, 'tz', None) else d for d in liq_dates if pd.notna(d)])
 
     # все строки большой таблицы по этому ИНН
     df_inn = df.loc[df['inn'] == inn_value].copy()
@@ -197,7 +215,7 @@ def flag_points_for_inn(final_df, df, inn_value,
             tc = [(s, (e + pd.Timedelta(days=grace_days) if pd.notna(e) else e))
                   for s, e in tc]
 
-        # фильтруем "гэпы без ИП" под жизнь точки (только пересекающиеся с периодом после её открытия)
+        # фильтруем "гэпы без ИП" под жизнь точки (только после её открытия)
         point_gaps = gaps
         if pd.notna(point_open):
             point_gaps = [(max(gs, point_open), ge)
@@ -208,8 +226,7 @@ def flag_points_for_inn(final_df, df, inn_value,
         any_violation = False
         if point_gaps:
             for gs, ge in point_gaps:
-                # непокрытая часть gap интервалами закрытий точки
-                uncovered = _subtract([(gs, ge)], tc)
+                uncovered = _subtract([(gs, ge)], tc)  # A\B
                 if uncovered:
                     any_violation = True
                     for us, ue in uncovered:
@@ -222,7 +239,9 @@ def flag_points_for_inn(final_df, df, inn_value,
                             'closed_dates': closed_list,
                             'reopen_dates': reopen_list,
                             'tc_intervals': tc,
-                            'point_open_date': point_open
+                            'point_open_date': point_open,
+                            'dadata_registration_dates': reg_dates,
+                            'dadata_liquidation_dates': liq_dates
                         })
 
         # если гэпов не было или все покрыты — положительная запись
@@ -236,10 +255,13 @@ def flag_points_for_inn(final_df, df, inn_value,
                 'closed_dates': closed_list,
                 'reopen_dates': reopen_list,
                 'tc_intervals': tc,
-                'point_open_date': point_open
+                'point_open_date': point_open,
+                'dadata_registration_dates': reg_dates,
+                'dadata_liquidation_dates': liq_dates
             })
 
     return pd.DataFrame(rows), ip_open, gaps
+
 
 # ===================== 4) ЗАПУСК ПО ВСЕМ ИНН =====================
 
