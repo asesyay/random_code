@@ -1,0 +1,7 @@
+for point, df_point in df_inn.groupby(point_col, dropna=False):
+-    closed_list = pd.to_datetime(df_point[closed_col], errors='coerce').dropna().sort_values().tolist()
+-    reopen_list = pd.to_datetime(df_point[reopen_col], errors='coerce').dropna().sort_values().tolist()
++    _cl = pd.to_datetime(df_point[closed_col], errors='coerce')
++    _ro = pd.to_datetime(df_point[reopen_col], errors='coerce')
++    closed_list = _cl[~_cl.dt.normalize().eq(pd.Timestamp('1970-01-01'))].dropna().sort_values().tolist()
++    reopen_list = _ro[~_ro.dt.normalize().eq(pd.Timestamp('1970-01-01'))].dropna().sort_values().tolist()
