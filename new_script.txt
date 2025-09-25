@@ -1,0 +1,201 @@
+import pandas as pd
+import json, ast
+
+# ===================== ВСПОМОГАТЕЛЬНОЕ =====================
+
+def _safe_parse_json(val):
+    """Возвращает dict/list из json_data независимо от формата (str JSON / str python dict / dict)."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, (dict, list)):
+        return val
+    assert isinstance(val, str), "json_data должен быть str или dict/list"
+    try:
+        return json.loads(val)
+    except json.JSONDecodeError:
+        # часто строки с одинарными кавычками — это питоновский литерал
+        return ast.literal_eval(val)
+
+def _union(intervals):
+    """Слияние пересекающихся/смежных интервалов [(start,end|NaT)] → список без пересечений."""
+    if not intervals:
+        return []
+    df = pd.DataFrame(intervals, columns=['start','end']).sort_values('start')
+    df['end_filled'] = df['end'].fillna(pd.Timestamp.max)
+    merged, cs, ce = [], df.iloc[0]['start'], df.iloc[0]['end_filled']
+    for i in range(1, len(df)):
+        s, e = df.iloc[i]['start'], df.iloc[i]['end_filled']
+        if s <= ce:
+            ce = max(ce, e)
+        else:
+            merged.append((cs, ce))
+            cs, ce = s, e
+    merged.append((cs, ce))
+    return [(s, (pd.NaT if e==pd.Timestamp.max else e)) for s, e in merged]
+
+def _subtract(A, B):
+    """A \ B для объединений интервалов. На выходе непокрытые куски A."""
+    fill = lambda x: x if pd.notna(x) else pd.Timestamp.max
+    A = [(a, fill(b)) for a,b in _union(A)]
+    B = [(a, fill(b)) for a,b in _union(B)]
+    if not A: return []
+    if not B: return [(a, (pd.NaT if b==pd.Timestamp.max else b)) for a,b in A]
+    res = []
+    for a0, a1 in A:
+        cur = a0
+        for b0, b1 in B:
+            if b1 <= cur or b0 >= a1:
+                continue
+            if b0 > cur:
+                res.append((cur, b0))
+            cur = max(cur, b1)
+            if cur >= a1:
+                break
+        if cur < a1:
+            res.append((cur, a1))
+    return [(s, (pd.NaT if e==pd.Timestamp.max else e)) for s,e in res if (e - s).total_seconds() > 0]
+
+# ===================== 1) ИНТЕРВАЛЫ ИП ИЗ DaData =====================
+
+def parse_dadata_intervals(json_val_or_str):
+    """
+    Возвращает интервалы работы ИП [(start, end|NaT), ...] из одного json_data.
+    Используй поверх всех строк по одному ИНН и потом _union().
+    """
+    data = _safe_parse_json(json_val_or_str)
+    rows = []
+    for s in (data or {}).get('suggestions', []):
+        st = (s.get('data') or {}).get('state') or {}
+        reg = st.get('registration_date')
+        if reg is None:
+            continue
+        liq = st.get('liquidation_date')
+        start = pd.to_datetime(reg, unit='ms', utc=True).tz_convert(None)
+        end   = (pd.to_datetime(liq, unit='ms', utc=True).tz_convert(None) 
+                 if liq is not None else pd.NaT)
+        rows.append((start, end))
+    return _union(rows)
+
+def dadata_intervals_for_inn(final_df, inn_value, json_col='json_data'):
+    """Собирает интервалы ИП по всем строкам данного ИНН в final_df."""
+    intervals = []
+    for js in final_df.loc[final_df['inn'] == inn_value, json_col]:
+        intervals += parse_dadata_intervals(js)
+    return _union(intervals)
+
+def gaps_without_ip(ip_open_intervals):
+    """Разрывы между интервалами ИП (когда ИП закрыт): [(gap_start, gap_end)]."""
+    if not ip_open_intervals:
+        return []
+    filled = [(s, (e if pd.notna(e) else pd.Timestamp.max)) for s, e in ip_open_intervals]
+    gaps = []
+    for (s1, e1), (s2, e2) in zip(filled[:-1], filled[1:]):
+        if e1 < s2:
+            gaps.append((e1, s2))
+    return [(a, (pd.NaT if b==pd.Timestamp.max else b)) for a, b in gaps if (b - a).total_seconds() > 0]
+
+# ===================== 2) ИНТЕРВАЛЫ ВРЕМЕННОГО ЗАКРЫТИЯ ДЛЯ ТОЧКИ =====================
+
+def temp_closed_intervals_for_point(df_point, closed_col='date_temp_closed', reopen_col='date_reopen'):
+    """
+    По строкам одной точки (одного id_cd) строит интервалы temp_closed → reopen.
+    Поддерживает несколько пар, незакрытый интервал тянется до +∞ (NaT).
+    """
+    g = df_point.copy()
+    g[closed_col] = pd.to_datetime(g[closed_col], errors='coerce')
+    g[reopen_col] = pd.to_datetime(g[reopen_col], errors='coerce')
+
+    events = []
+    for _, r in g.iterrows():
+        if pd.notna(r[closed_col]): events.append(('open',  r[closed_col]))
+        if pd.notna(r[reopen_col]): events.append(('close', r[reopen_col]))
+    if not events:
+        return []
+
+    events.sort(key=lambda x: (x[1], 0 if x[0]=='open' else 1))
+    intervals, stack = [], None
+    for typ, ts in events:
+        if typ == 'open':
+            if stack is None:
+                stack = ts
+            else:
+                # второе подряд "open" — считаем закрытием предыдущего в момент нового
+                intervals.append((stack, ts))
+                stack = ts
+        else:  # close
+            if stack is not None and ts >= stack:
+                intervals.append((stack, ts))
+                stack = None
+    if stack is not None:  # незакрытый тянется до +∞
+        intervals.append((stack, pd.NaT))
+    return _union(intervals)
+
+# ===================== 3) ОСНОВНАЯ: ПРОВЕРКА ПО КАЖДОЙ ТОЧКЕ (id_cd) =====================
+
+def flag_points_for_inn(final_df, df, inn_value,
+                        point_col='id_cd',
+                        closed_col='date_temp_closed',
+                        reopen_col='date_reopen',
+                        grace_days=0):
+    """
+    По одному ИНН:
+      - строит интервалы ИП (DaData) и "гэпы без ИП";
+      - для КАЖДОЙ точки (point_col=id_cd) строит интервалы temp_closed;
+      - проверяет покрытие: каждую "дыру без ИП" должна закрывать точка.
+    Возвращает (flags_df, ip_open_intervals, ip_gaps).
+    flags_df: [inn, id_cd, ok_flag, gap_start, gap_end, uncovered_start, uncovered_end]
+    """
+    ip_open = dadata_intervals_for_inn(final_df, inn_value)
+    gaps = gaps_without_ip(ip_open)
+
+    df_inn = df.loc[df['inn'] == inn_value].copy()
+    rows = []
+
+    for point, df_point in df_inn.groupby(point_col, dropna=False):
+        tc = temp_closed_intervals_for_point(df_point, closed_col, reopen_col)
+        if grace_days:
+            tc = [(s, (e + pd.Timedelta(days=grace_days) if pd.notna(e) else e)) for s, e in tc]
+
+        any_violation = False
+        if gaps:
+            for gs, ge in gaps:
+                uncovered = _subtract([(gs, ge)], tc)
+                if uncovered:
+                    any_violation = True
+                    for us, ue in uncovered:
+                        rows.append({
+                            'inn': inn_value,
+                            point_col: point,
+                            'ok_flag': False,
+                            'gap_start': gs, 'gap_end': ge,
+                            'uncovered_start': us, 'uncovered_end': ue
+                        })
+        if not gaps or not any_violation:
+            rows.append({
+                'inn': inn_value,
+                point_col: point,
+                'ok_flag': True,
+                'gap_start': None, 'gap_end': None,
+                'uncovered_start': None, 'uncovered_end': None
+            })
+
+    return pd.DataFrame(rows), ip_open, gaps
+
+# ===================== 4) ЗАПУСК ПО ВСЕМ ИНН =====================
+
+def run_all(final_df, df,
+            point_col='id_cd',
+            closed_col='date_temp_closed',
+            reopen_col='date_reopen',
+            grace_days=0):
+    out = []
+    for inn_value in final_df['inn'].dropna().unique():
+        flags_df, _, _ = flag_points_for_inn(final_df, df, inn_value,
+                                             point_col=point_col,
+                                             closed_col=closed_col,
+                                             reopen_col=reopen_col,
+                                             grace_days=grace_days)
+        out.append(flags_df)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(
+        columns=['inn', point_col, 'ok_flag', 'gap_start', 'gap_end', 'uncovered_start', 'uncovered_end']
+    )
