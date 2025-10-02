@@ -1,7 +1,40 @@
-for point, df_point in df_inn.groupby(point_col, dropna=False):
--    closed_list = pd.to_datetime(df_point[closed_col], errors='coerce').dropna().sort_values().tolist()
--    reopen_list = pd.to_datetime(df_point[reopen_col], errors='coerce').dropna().sort_values().tolist()
-+    _cl = pd.to_datetime(df_point[closed_col], errors='coerce')
-+    _ro = pd.to_datetime(df_point[reopen_col], errors='coerce')
-+    closed_list = _cl[~_cl.dt.normalize().eq(pd.Timestamp('1970-01-01'))].dropna().sort_values().tolist()
-+    reopen_list = _ro[~_ro.dt.normalize().eq(pd.Timestamp('1970-01-01'))].dropna().sort_values().tolist()
+SELECT
+  REGEXP_SUBSTR(t1.OrderNumber, '[^-]+')     AS user_id,
+  t2.ItemId                                   AS ItemIdBefore,         -- старый ItemId
+  t2.Name                                     AS NameItem,
+  t1.FirstPrice,
+  t1.Price,
+  t1.FirstPrice - t1.Price                    AS PriceDifference,
+  t1.ClientPostingId                          AS ClientPostingId,
+  t3.PostingNumber                            AS PostingNumber,        -- текущий постинг
+  t2.DamageReason,
+  t1.OrderDate,
+
+  -- ✅ номер "старого" постинга, найденный по ItemId из t2
+  t3_old.PostingNumber                        AS OldPostingNumber
+
+FROM dwh.Dim_ClientPostingItem AS t1
+JOIN dwh.Dim_ItemDiscounted    AS t2
+  ON t2.ItemDiscountedId = t1.ItemId
+
+LEFT JOIN dwh_data.Atr_ClientPosting_PostingNumber AS t3
+  ON t3.ClientPostingId = t1.ClientPostingId
+
+-- самоджойн: берём строку(и) из t1 по "старому" ItemId из t2
+-- если потенциально много строк, берём самую свежую по дате
+LEFT JOIN (
+    SELECT
+      ItemId,
+      ClientPostingId,
+      ROW_NUMBER() OVER (PARTITION BY ItemId ORDER BY OrderDate DESC) AS rn
+    FROM dwh.Dim_ClientPostingItem
+) AS t1_old
+  ON t1_old.ItemId = t2.ItemId
+ AND t1_old.rn = 1                         -- берём одну «лучшую» (самую свежую)
+
+LEFT JOIN dwh_data.Atr_ClientPosting_PostingNumber AS t3_old
+  ON t3_old.ClientPostingId = t1_old.ClientPostingId
+
+-- было: TRUNC(t1.OrderDate) = CURRENT_DATE - INTERVAL '1 day'
+-- так быстрее и использует сорт/диапазон по проекциям
+WHERE t1.OrderDate::DATE = CURRENT_DATE - 1;
