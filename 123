@@ -1,5 +1,6 @@
 import pandas as pd
 import sqlalchemy as sa
+import math
 from datetime import datetime
 
 def log(*args):
@@ -7,64 +8,82 @@ def log(*args):
 
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+        yield i // n + 1, lst[i:i+n]  # 1-based индекс батча и список
 
-SQL_RETURN_SKU_BY_LIST = """
-SELECT DISTINCT SKU
+SQL_RETURN_POSTING_SKU_BY_POSTINGS = """
+SELECT DISTINCT PostingNumber, SKU
 FROM dwh.Dim_ExemplarInfo
 WHERE PostingIsReturn = TRUE
-  AND SKU IN ({sku_list})
+  AND PostingNumber IN ({pn_list})
 """
 
-def filter_postings_by_returns_sku_batched(engine, df_postings, sku_batch=2000):
+def filter_postings_by_returns_posting_and_sku_batched(
+    engine,
+    df_postings: pd.DataFrame,
+    posting_batch: int = 5000,
+    verbose: bool = True
+) -> pd.DataFrame:
     """
-    Фильтрует df_postings по возвратным SKU (PostingIsReturn=TRUE) из dwh.Dim_ExemplarInfo.
+    Оставляет в df_postings только те строки, для которых в dwh.Dim_ExemplarInfo
+    есть запись с PostingIsReturn=TRUE по ЭТОМУ ЖЕ PostingNumber и ЭТОМУ ЖЕ SKU.
 
-    Параметры
-    ---------
-    engine : sqlalchemy.Engine
-        Подключение к Vertica.
-    df_postings : pd.DataFrame
-        Должна содержать колонку 'RezonItemId' (SKU).
-    sku_batch : int
-        Размер батча для IN-проверки SKU в ExemplarInfo.
+    Требования к df_postings: столбцы 'PostingNumber' и 'RezonItemId' (SKU).
 
-    Возвращает
-    ----------
-    pd.DataFrame
-        Отфильтрованный df_postings (только возвратные SKU) + колонка 'PostingIsReturn'=True.
-        Если ни один SKU не помечён как возвратный — вернёт пустой DataFrame с теми же колонками.
+    Параметры:
+      - engine: SQLAlchemy engine к Vertica
+      - df_postings: DataFrame с заказами (без JOIN к ExemplarInfo)
+      - posting_batch: размер батча для списка PostingNumber в IN (...)
+      - verbose: печатать прогресс
     """
     if df_postings is None or df_postings.empty:
+        if verbose: log("df_postings пуст — возвращаю как есть.")
         return df_postings
 
-    # нормализуем SKU в строку
+    # нормализуем и проверяем колонки
     work = df_postings.copy()
-    work["RezonItemId"] = work["RezonItemId"].astype(str)
-    skus = sorted(work["RezonItemId"].dropna().unique())
+    for col in ("PostingNumber", "RezonItemId"):
+        if col not in work.columns:
+            raise KeyError(f"В df_postings нет колонки '{col}'.")
+        work[col] = work[col].astype(str)
 
-    if not skus:
-        # нет SKU — нечего фильтровать
+    posting_list = sorted(work["PostingNumber"].dropna().unique())
+    total_to_check = len(posting_list)
+    if total_to_check == 0:
+        if verbose: log("Нет PostingNumber для проверки — возвращаю пустой результат.")
         return work.iloc[0:0].copy()
 
-    # тянем возвратные SKU батчами
+    num_batches = math.ceil(total_to_check / posting_batch)
+    if verbose:
+        log(f"PostingNumber к проверке: {total_to_check} | Батчей: {num_batches} | Размер батча: {posting_batch}")
+
     parts = []
-    for part in _chunks(skus, sku_batch):
-        sku_sql = ",".join(f"'{x}'" for x in part)
-        sql = SQL_RETURN_SKU_BY_LIST.format(sku_list=sku_sql)
-        df = pd.read_sql(sa.text(sql), engine)
-        parts.append(df)
-        log(f"return-SKU batch: asked={len(part)}, matched={len(df)}")
+    matched_total = 0
 
-    df_return_sku = pd.concat(parts, ignore_index=True).drop_duplicates() if parts else pd.DataFrame(columns=["SKU"])
-    if df_return_sku.empty:
-        log("no return SKUs matched; result is empty")
+    # Вытягиваем ТОЛЬКО пары (PostingNumber, SKU) по возвратам для наших PostingNumber
+    for batch_idx, part in _chunks(posting_list, posting_batch):
+        pn_sql = ",".join(f"'{x}'" for x in part)
+        sql = SQL_RETURN_POSTING_SKU_BY_POSTINGS.format(pn_list=pn_sql)
+        df_pairs = pd.read_sql(sa.text(sql), engine)
+        parts.append(df_pairs)
+        matched_total += len(df_pairs)
+        if verbose:
+            log(f"[{batch_idx}/{num_batches}] return-PAIR batch: asked_pn={len(part)}, matched_pairs={len(df_pairs)}, total_pairs={matched_total}")
+
+    df_return_pairs = pd.concat(parts, ignore_index=True).drop_duplicates() if parts else pd.DataFrame(columns=["PostingNumber","SKU"])
+    if df_return_pairs.empty:
+        if verbose: log("Итог: ни одна пара (PostingNumber, SKU) не помечена как возвратная — результат пуст.")
         return work.iloc[0:0].copy()
 
-    df_return_sku["SKU"] = df_return_sku["SKU"].astype(str)
+    # Приводим к строкам и мержим по двум ключам: PostingNumber & SKU == RezonItemId
+    df_return_pairs["PostingNumber"] = df_return_pairs["PostingNumber"].astype(str)
+    df_return_pairs["SKU"] = df_return_pairs["SKU"].astype(str)
 
-    # локальный inner-merge по SKU
-    out = work.merge(df_return_sku.rename(columns={"SKU": "RezonItemId"}), on="RezonItemId", how="inner")
-    out["PostingIsReturn"] = True
-    log("postings after return filter:", len(out))
+    out = work.merge(
+        df_return_pairs.rename(columns={"SKU": "RezonItemId"}),
+        on=["PostingNumber", "RezonItemId"],
+        how="inner"
+    )
+    out["PostingIsReturn"] = True  # удобный флаг
+    if verbose:
+        log(f"Итог: строк после фильтра по возвратам (по PN+SKU) = {len(out)} (из {len(work)})")
     return out
