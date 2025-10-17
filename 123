@@ -1,103 +1,32 @@
-# --- подготовка: страховка от дубликатов колонок и выбор колонки товара ---
-df_postings = df_postings.loc[:, ~df_postings.columns.duplicated()].copy()
-df_postings["current_user_id"] = df_postings["current_user_id"].astype(str)
+def filter_postings_by_returns_sku_batched(engine, df_postings, sku_batch=2000):
+    """
+    Берёт уникальные RezonItemId из df_postings, проверяет их на возврат в Dim_ExemplarInfo,
+    и оставляет в df_postings только строки со SKU, у которых PostingIsReturn=TRUE.
+    """
+    if df_postings.empty:
+        return df_postings
 
-# Определяем, какое поле использовать как товар из postings
-if "item_id_str" in df_postings.columns:
-    item_col = "item_id_str"
-elif "ItemId" in df_postings.columns:
-    item_col = "ItemId"
-else:
-    raise KeyError("Не найдена колонка товара в df_postings (ожидались 'item_id_str' или 'ItemId').")
+    skus = sorted(df_postings["RezonItemId"].dropna().astype(str).unique())
+    if not skus:
+        return df_postings.iloc[0:0].copy()
 
-df_postings[item_col] = df_postings[item_col].astype(str)
+    dfs = []
+    for part in chunks(skus, sku_batch):
+        sku_sql = ",".join(f"'{x}'" for x in part)
+        sql = SQL_RETURN_SKU_BY_LIST.format(sku_list=sku_sql)
+        df = pd.read_sql(sa.text(sql), engine)
+        dfs.append(df)
+        log(f"return-SKU batch: sku={len(part)}, matched={len(df)}")
 
-# --- связи original → affiliate ---
-mapping_aff = mapping.copy()
-mapping_aff["relation"] = "affiliate"
-mapping_aff = mapping_aff.rename(columns={"duplicate_user_id": "candidate_user_id"})[
-    ["original_user_id", "candidate_user_id", "relation"]
-]
+    df_return_sku = pd.concat(dfs, ignore_index=True).drop_duplicates() if dfs else pd.DataFrame(columns=["SKU"])
+    if df_return_sku.empty:
+        log("no return SKUs matched; result is empty")
+        return df_postings.iloc[0:0].copy()
 
-# --- связи original → self ---
-# Берём множество original из mapping ИЛИ из df_base (на случай, если mapping пуст)
-originals_from_mapping = set(mapping["original_user_id"].astype(str)) if not mapping.empty else set()
-originals_from_base = set(df_base["user_id"].astype(str))
-original_ids_all = sorted(originals_from_mapping | originals_from_base)
-
-mapping_self = pd.DataFrame({
-    "original_user_id": original_ids_all,
-    "candidate_user_id": original_ids_all,  # self-связь
-    "relation": "self",
-})
-
-# --- объединяем связи ---
-df_candidates = pd.concat([mapping_aff, mapping_self], ignore_index=True).drop_duplicates()
-df_candidates["original_user_id"] = df_candidates["original_user_id"].astype(str)
-df_candidates["candidate_user_id"] = df_candidates["candidate_user_id"].astype(str)
-
-# --- пары (original_user_id, ItemIdBefore) + ключи заказа из base для фильтра self=тот же заказ ---
-# Убедимся, что ключи есть в df_base
-need_in_base = ["user_id", "ItemIdBefore"]
-have_ids = [c for c in ["ClientPostingID", "PostingNumber"] if c in df_base.columns]
-df_base_pairs = (
-    df_base[need_in_base + have_ids]
-    .dropna(subset=["user_id", "ItemIdBefore"])
-    .astype(str)
-    .drop_duplicates()
-    .rename(columns={"user_id": "original_user_id"})
-)
-
-# --- join1: кто сделал заказ (candidate_user_id == current_user_id) ---
-tmp = df_postings.merge(
-    df_candidates, left_on="current_user_id", right_on="candidate_user_id", how="inner"
-)
-
-# --- join2: совпадение по товару и привязка к исходному пользователю ---
-# даём суффиксы, чтобы различать base-поля заказа
-df_item_matches = tmp.merge(
-    df_base_pairs,
-    left_on=["original_user_id", item_col],       # товар из postings
-    right_on=["original_user_id", "ItemIdBefore"],# товар из base
-    how="inner",
-    suffixes=("", "_base")
-)
-
-# --- фильтр: убрать self, где это тот же заказ из base ---
-cols = set(df_item_matches.columns)
-
-same_by_clientposting = False
-if {"ClientPostingId", "ClientPostingID_base"} <= cols:
-    same_by_clientposting = (
-        df_item_matches["ClientPostingId"].astype(str) ==
-        df_item_matches["ClientPostingID_base"].astype(str)
-    )
-
-same_by_postingnumber = False
-if {"PostingNumber", "PostingNumber_base"} <= cols:
-    same_by_postingnumber = (
-        df_item_matches["PostingNumber"].astype(str) ==
-        df_item_matches["PostingNumber_base"].astype(str)
-    )
-
-if isinstance(same_by_clientposting, (pd.Series, np.ndarray)) or isinstance(same_by_postingnumber, (pd.Series, np.ndarray)):
-    same_order = (
-        (same_by_clientposting if isinstance(same_by_clientposting, (pd.Series, np.ndarray)) else False) |
-        (same_by_postingnumber if isinstance(same_by_postingnumber, (pd.Series, np.ndarray)) else False)
-    )
-    mask_same_self = (df_item_matches["relation"] == "self") & same_order
-    df_item_matches = df_item_matches[~mask_same_self].copy()
-
-# --- вывод итога ---
-log("item matches (после фильтра 'self=тот же заказ' удалены):", len(df_item_matches))
-
-# покажем ключевые поля, если есть
-pref_cols = [
-    "original_user_id", "relation", "candidate_user_id",
-    "ItemIdBefore", item_col,
-    "ClientPostingID_base", "PostingNumber_base",  # из base
-    "ClientPostingId", "PostingNumber",            # из postings
-    "OrderDate", "Price", "FirstPrice"
-]
-view_cols = [c for c in pref_cols if c in df_item_matches.columns]
-display(df_item_matches[view_cols].head(5) if view_cols else df_item_matches.head(5))
+    df_return_sku["SKU"] = df_return_sku["SKU"].astype(str)
+    # локальный inner-merge
+    out = df_postings.merge(df_return_sku.rename(columns={"SKU": "RezonItemId"}), on="RezonItemId", how="inner")
+    # для удобства флаг (все строки уже TRUE)
+    out["PostingIsReturn"] = True
+    log("postings after return filter:", len(out))
+    return out
